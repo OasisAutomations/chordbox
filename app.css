@@ -76,7 +76,7 @@ button { font: inherit; color: inherit; border: 0; background: none; cursor: poi
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; font-size: 13px; }
 .brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); box-shadow: 0 0 8px var(--accent2); }
-.brand .ver { opacity: .45; font-weight: 500; font-size: 11px; }
+.brand .ver { opacity: 1; font-weight: 700; font-size: 11px; padding: 2px 7px; border-radius: 999px; background: #1a1c1f; color: var(--read); border: 1px solid #0c0d0e; letter-spacing: .04em; }
 .readout {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 11px; color: var(--read); background: #1a1d20;
@@ -127,7 +127,7 @@ button { font: inherit; color: inherit; border: 0; background: none; cursor: poi
 .xy-hint { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; opacity: .4; }
 
 .funcs {
-  display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px;
+  display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px;
 }
 .fbtn {
   display: flex; flex-direction: column; align-items: center; gap: 2px;
@@ -138,7 +138,8 @@ button { font: inherit; color: inherit; border: 0; background: none; cursor: poi
   min-height: 48px;
 }
 .fbtn span { font-size: 9px; letter-spacing: .1em; opacity: .55; }
-.fbtn b { font-size: 12px; font-weight: 700; }
+.fbtn b { font-size: 11px; font-weight: 700; }
+.fbtn#btnLatch[aria-pressed="true"] b { color: var(--gold); }
 .fbtn:active, .fbtn[aria-pressed="true"] {
   transform: translateY(2px); box-shadow: 0 1px 0 #1a1c1f, inset 0 2px 4px #0006;
   background: linear-gradient(180deg, #3a3d42, #2a2c30);

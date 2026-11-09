@@ -1,6 +1,6 @@
 /* Chordbox v1.0 — original pocket chord synth (Web Audio). Offline PWA. */
 'use strict';
-const VER = 'v1.0.2';
+const VER = 'v1.0.3';
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
@@ -20,6 +20,8 @@ const state = {
   fx: 'room',
   bpm: 96,
   arp: false,
+  latch: false,
+  latchedDeg: null, // mono latch: which degree is locked on
   met: false,
   xy: { x: 0, y: 0, held: false }, // -1..1
   held: new Map(),  // degree -> voice
@@ -206,7 +208,58 @@ function makeVoice(midi, when = ac.currentTime) {
   };
 }
 
-function startChord(deg, fromLoop = false) {
+/** Short, loud, fast-attack voice for every arp step — audible in all presets. */
+function makeArpVoice(midi, stepMs, when = ac.currentTime) {
+  const out = ac.createGain(); out.connect(filter);
+  const hz = midiToHz(midi);
+  const partials = [];
+  const snd = state.sound;
+  const gate = Math.max(0.09, Math.min(0.55, (stepMs / 1000) * 0.7));
+  if (snd === 'organ') {
+    [1, 2, 3].forEach((mul, i) => {
+      const o = ac.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(hz * mul, when);
+      const g = ac.createGain(); g.gain.value = 0.28 / (i + 1);
+      o.connect(g); g.connect(out); o.start(when); partials.push(o);
+    });
+  } else if (snd === 'pad') {
+    const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.setValueAtTime(hz, when);
+    const o2 = ac.createOscillator(); o2.type = 'triangle'; o2.frequency.setValueAtTime(hz * 2, when);
+    const g2 = ac.createGain(); g2.gain.value = 0.2;
+    o.connect(out); o2.connect(g2); g2.connect(out); o.start(when); o2.start(when); partials.push(o, o2);
+  } else if (snd === 'pluck') {
+    const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.setValueAtTime(hz, when);
+    const f = ac.createBiquadFilter(); f.type = 'lowpass';
+    f.frequency.setValueAtTime(Math.min(8000, hz * 8), when);
+    f.frequency.exponentialRampToValueAtTime(hz * 2, when + gate);
+    o.connect(f); f.connect(out); o.start(when); partials.push(o);
+  } else {
+    const o = ac.createOscillator(); o.type = 'triangle'; o.frequency.setValueAtTime(hz, when);
+    const o2 = ac.createOscillator(); o2.type = 'square'; o2.frequency.setValueAtTime(hz, when);
+    const g2 = ac.createGain(); g2.gain.value = 0.12;
+    o.connect(out); o2.connect(g2); g2.connect(out); o.start(when); o2.start(when); partials.push(o, o2);
+  }
+  // Punchy envelope: fast attack, audible body, clean release within the step
+  out.gain.setValueAtTime(0.0001, when);
+  out.gain.exponentialRampToValueAtTime(0.85, when + 0.008);
+  out.gain.exponentialRampToValueAtTime(0.45, when + Math.max(0.04, gate * 0.45));
+  out.gain.exponentialRampToValueAtTime(0.0001, when + gate);
+  partials.forEach(o => { try { o.stop(when + gate + 0.05); } catch (_) {} });
+  return {
+    out, partials,
+    stop() {
+      const t = ac.currentTime;
+      try {
+        out.gain.cancelScheduledValues(t);
+        out.gain.setValueAtTime(Math.max(0.0001, out.gain.value), t);
+        out.gain.exponentialRampToValueAtTime(0.0001, t + 0.03);
+      } catch (_) {}
+      partials.forEach(o => { try { o.stop(t + 0.05); } catch (_) {} });
+    }
+  };
+}
+
+function startChord(deg, fromLoop = false, { latched = false } = {}) {
   if (!ac) return;
   // Silent replace: don't record a false off or tear down the arp interval mid-hold
   if (state.held.has(deg)) {
@@ -215,8 +268,9 @@ function startChord(deg, fromLoop = false) {
     state.held.delete(deg);
   }
   const { notes, label } = chordMidi(deg);
-  const voices = notes.map(n => makeVoice(n));
-  state.held.set(deg, { voices, label, notes, t0: ac.currentTime, fromLoop: !!fromLoop });
+  // With ARP on, don't stack a sustained chord under the arp — the arp IS the sound
+  const voices = state.arp ? [] : notes.map(n => makeVoice(n));
+  state.held.set(deg, { voices, label, notes, t0: ac.currentTime, fromLoop: !!fromLoop, latched: !!latched });
   paintKey(deg, true, label);
   if (state.arp) ensureArp();
   if (state.loop.rec && !fromLoop) recordEvent('on', deg);
@@ -227,6 +281,7 @@ function stopChord(deg, fromLoop = false) {
   if (!v) return;
   v.voices.forEach(x => x.stop());
   state.held.delete(deg);
+  if (state.latchedDeg === deg) state.latchedDeg = null;
   paintKey(deg, false);
   if (state.loop.rec && !fromLoop) recordEvent('off', deg);
   if (!state.held.size) stopArp();
@@ -235,6 +290,8 @@ function stopChord(deg, fromLoop = false) {
 
 /* ---------- arp ---------- */
 let arpNoteTimers = [];
+let arpStepIndex = 0;
+let arpNextAt = 0; // audio-time scheduler (survives timer throttling better while page is open)
 function stopArpNotes() {
   for (const { id, voice } of arpNoteTimers) { clearTimeout(id); try { voice.stop(); } catch (_) {} }
   arpNoteTimers = [];
@@ -242,27 +299,41 @@ function stopArpNotes() {
 function stopArp() {
   if (arpTimer) { clearInterval(arpTimer); arpTimer = null; }
   stopArpNotes();
+  arpNextAt = 0;
 }
+function arpStepMs() { return (60 / state.bpm) * 1000 / 2; } // 8th notes
 function ensureArp() {
-  if (arpTimer || !state.arp) return;
-  let i = 0;
+  if (!state.arp) return;
+  if (arpTimer) return; // already running — keep cycling
   state.arpFires = state.arpFires || 0;
-  const step = () => {
-    if (!state.arp || !state.held.size) { stopArp(); return; }
+  arpStepIndex = 0;
+  arpNextAt = 0;
+  const fireOne = (when, stepMs) => {
     const entries = [...state.held.values()];
     const all = entries.flatMap(e => e.notes);
     if (!all.length) return;
-    const n = all[i % all.length];
-    const v = makeVoice(n);
+    const n = all[arpStepIndex % all.length];
+    const v = makeArpVoice(n, stepMs, when);
     state.arpFires++;
-    const dur = Math.max(80, (60 / state.bpm) * 1000 * 0.35);
-    const id = setTimeout(() => { v.stop(); arpNoteTimers = arpNoteTimers.filter(x => x.id !== id); }, dur);
+    arpStepIndex++;
+    const id = setTimeout(() => { arpNoteTimers = arpNoteTimers.filter(x => x.id !== id); }, stepMs + 80);
     arpNoteTimers.push({ id, voice: v });
-    i++;
   };
-  step();
-  // half-notes at BPM — keep going until every held key is released
-  arpTimer = setInterval(step, (60 / state.bpm) * 1000 / 2);
+  const tick = () => {
+    if (!state.arp || !state.held.size) { stopArp(); return; }
+    if (!ac) return;
+    const stepMs = arpStepMs();
+    const now = ac.currentTime;
+    if (!arpNextAt || arpNextAt < now - 0.2) arpNextAt = now;
+    let guard = 0;
+    while (arpNextAt <= now + 0.025 && guard++ < 3) {
+      fireOne(Math.max(arpNextAt, now), stepMs);
+      arpNextAt += stepMs / 1000;
+    }
+  };
+  tick();
+  // Poll often; audio clock decides when a step is due (one note per step, not per poll)
+  arpTimer = setInterval(tick, 30);
 }
 
 /* ---------- XY pad ---------- */
@@ -447,6 +518,7 @@ function clearLoop() {
   state.loop.len = 0;
   cancelLoopSched();
   keyPointers.clear();
+  state.latchedDeg = null;
   silenceAllVoices();
   syncLoopButtons();
   if (state.met) {
@@ -461,56 +533,101 @@ function clearLoop() {
 // Active pointer ids per degree — sustains across Android long-press / scroll attempts
 const keyPointers = new Map(); // deg -> Set<pointerId>
 
+function activeIds(deg) {
+  if (!keyPointers.has(deg)) keyPointers.set(deg, new Set());
+  return keyPointers.get(deg);
+}
+function keyIsDown(deg) { return (keyPointers.get(deg)?.size || 0) > 0 || state.latchedDeg === deg; }
+
+/** Latch: tap toggles; tapping another key switches; HOLD off releases. */
+let lastLatchAt = 0;
+function tapLatch(deg) {
+  // Pointer + Touch both fire on Android/Chrome — debounce so one tap ≠ on then off
+  const now = performance.now();
+  if (now - lastLatchAt < 80) return;
+  lastLatchAt = now;
+  resume();
+  if (state.latchedDeg === deg) {
+    keyPointers.delete(deg);
+    stopChord(deg);
+    state.latchedDeg = null;
+    return;
+  }
+  if (state.latchedDeg != null && state.latchedDeg !== deg) {
+    const prev = state.latchedDeg;
+    keyPointers.delete(prev);
+    stopChord(prev);
+  }
+  state.latchedDeg = deg;
+  startChord(deg, false, { latched: true });
+}
+
 function bindKeyPointer(btn, deg) {
-  const active = () => { if (!keyPointers.has(deg)) keyPointers.set(deg, new Set()); return keyPointers.get(deg); };
-  const down = (e) => {
+  // Track both pointerIds and touch identifiers. Android long-press fires pointercancel with
+  // buttons=0 while the finger is still down — we IGNORE cancel and only release on real up/end.
+  const addId = (id) => {
+    const ids = activeIds(deg);
+    const first = ids.size === 0 && state.latchedDeg !== deg;
+    ids.add(id);
+    return first;
+  };
+  const removeId = (id) => {
+    const ids = keyPointers.get(deg);
+    if (!ids || !ids.has(id)) return false;
+    ids.delete(id);
+    if (ids.size === 0) keyPointers.delete(deg);
+    return !keyIsDown(deg);
+  };
+
+  const pointerDown = (e) => {
     if (e.button != null && e.button !== 0) return;
-    e.preventDefault();
-    e.stopPropagation();
-    resume();
-    const ids = active();
-    const first = ids.size === 0;
-    ids.add(e.pointerId);
-    try { btn.setPointerCapture(e.pointerId); } catch (_) {}
-    if (first) startChord(deg);
-  };
-  const up = (e) => {
-    e.preventDefault();
-    const ids = keyPointers.get(deg);
-    if (!ids || !ids.has(e.pointerId)) return;
-    ids.delete(e.pointerId);
-    try { if (btn.hasPointerCapture?.(e.pointerId)) btn.releasePointerCapture(e.pointerId); } catch (_) {}
-    if (ids.size === 0) { keyPointers.delete(deg); stopChord(deg); }
-  };
-  // Android Chrome often fires pointercancel on long-press when a context menu would open.
-  // We prevent the menu; if cancel still arrives but the finger is logically down, keep sustaining.
-  const cancel = (e) => {
-    e.preventDefault();
-    const ids = keyPointers.get(deg);
-    if (!ids || !ids.has(e.pointerId)) return;
-    // If the browser still reports the button/finger as down, ignore this cancel (long-press noise)
-    if (e.buttons && (e.buttons & 1)) return;
-    ids.delete(e.pointerId);
-    if (ids.size === 0) { keyPointers.delete(deg); stopChord(deg); }
-  };
-  btn.addEventListener('pointerdown', down);
-  btn.addEventListener('pointerup', up);
-  btn.addEventListener('pointercancel', cancel);
-  // Do NOT stop on lostpointercapture or pointerleave — capture + up handle release.
-  // Leaving the key while held must keep the chord/arp going (joystick-style sustain).
-  btn.addEventListener('pointerleave', e => { e.preventDefault(); });
-  btn.addEventListener('lostpointercapture', e => {
-    // Only release if we no longer track this pointer as down (real release already ran).
-    const ids = keyPointers.get(deg);
-    if (ids && ids.has(e.pointerId) && !(e.buttons & 1)) {
-      ids.delete(e.pointerId);
-      if (ids.size === 0) { keyPointers.delete(deg); stopChord(deg); }
+    e.preventDefault(); e.stopPropagation(); resume();
+    if (state.latch) {
+      // debounce: latch uses click-like gesture; ignore extra pointers while switching
+      if (e.pointerType === 'touch' && btn._latchTouched) return;
+      tapLatch(deg);
+      return;
     }
-  });
+    try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+    if (addId('p' + e.pointerId)) startChord(deg);
+  };
+  const pointerUp = (e) => {
+    e.preventDefault();
+    if (state.latch) return; // latched chords ignore finger-up
+    try { if (btn.hasPointerCapture?.(e.pointerId)) btn.releasePointerCapture(e.pointerId); } catch (_) {}
+    if (removeId('p' + e.pointerId)) stopChord(deg);
+  };
+
+  btn.addEventListener('pointerdown', pointerDown);
+  btn.addEventListener('pointerup', pointerUp);
+  // Critical: do NOT stop on pointercancel / lostpointercapture — Android long-press noise
+  btn.addEventListener('pointercancel', e => { e.preventDefault(); });
+  btn.addEventListener('lostpointercapture', e => { e.preventDefault(); });
+  btn.addEventListener('pointerleave', e => { e.preventDefault(); });
   btn.addEventListener('contextmenu', e => { e.preventDefault(); e.stopPropagation(); });
-  // Non-passive touchstart so iOS/Android can't scroll/select on long press
-  btn.addEventListener('touchstart', e => { e.preventDefault(); }, { passive: false });
-  btn.addEventListener('touchend', e => { e.preventDefault(); }, { passive: false });
+
+  // Touch Events fallback (and dual-track so cancel of the pointer doesn't end the note)
+  btn.addEventListener('touchstart', (e) => {
+    e.preventDefault(); e.stopPropagation(); resume();
+    if (state.latch) {
+      btn._latchTouched = true;
+      tapLatch(deg);
+      setTimeout(() => { btn._latchTouched = false; }, 50);
+      return;
+    }
+    for (const t of e.changedTouches) {
+      if (addId('t' + t.identifier)) startChord(deg);
+    }
+  }, { passive: false });
+  btn.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    if (state.latch) return;
+    for (const t of e.changedTouches) {
+      if (removeId('t' + t.identifier)) stopChord(deg);
+    }
+  }, { passive: false });
+  // Ignore touchcancel for the same reason as pointercancel (long-press / system gesture)
+  btn.addEventListener('touchcancel', (e) => { e.preventDefault(); }, { passive: false });
 }
 
 function scaleLabels() {
@@ -555,6 +672,7 @@ function refreshReadout() {
   $('#octLbl').textContent = state.octave;
   $('#sndLbl').textContent = snd;
   $('#arpLbl').textContent = state.arp ? 'On' : 'Off';
+  if ($('#latchLbl')) $('#latchLbl').textContent = state.latch ? 'On' : 'Off';
   $('#bpmLbl').textContent = state.bpm;
   $('#ver').textContent = VER;
 }
@@ -609,11 +727,36 @@ function wire() {
     refreshReadout();
     $('#dlgSound').close();
   });
-  $('#btnArp').onclick = () => {
+    $('#btnArp').onclick = () => {
     state.arp = !state.arp;
     $('#btnArp').setAttribute('aria-pressed', String(state.arp));
-    if (state.arp && state.held.size) ensureArp();
-    if (!state.arp) stopArp();
+    if (!state.arp) {
+      stopArp();
+      // restore sustained voices under any held/latched chords
+      for (const deg of [...state.held.keys()]) {
+        const h = state.held.get(deg);
+        startChord(deg, h.fromLoop, { latched: !!h.latched });
+      }
+    } else {
+      // switch held chords to arp-only voices
+      stopArp();
+      for (const deg of [...state.held.keys()]) {
+        const h = state.held.get(deg);
+        startChord(deg, h.fromLoop, { latched: !!h.latched });
+      }
+      if (state.held.size) ensureArp();
+    }
+    refreshReadout();
+  };
+  $('#btnLatch').onclick = () => {
+    state.latch = !state.latch;
+    $('#btnLatch').setAttribute('aria-pressed', String(state.latch));
+    if (!state.latch && state.latchedDeg != null) {
+      const d = state.latchedDeg;
+      state.latchedDeg = null;
+      keyPointers.delete(d);
+      stopChord(d);
+    }
     refreshReadout();
   };
   $('#btnTempo').onclick = () => {
@@ -671,7 +814,27 @@ buildKeys();
 refreshReadout();
 
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
+  window.addEventListener('load', async () => {
+    try {
+      const reg = await navigator.serviceWorker.register('./sw.js');
+      reg.addEventListener('updatefound', () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener('statechange', () => {
+          if (nw.state === 'installed' && navigator.serviceWorker.controller) nw.postMessage('skipWaiting');
+        });
+      });
+      // Poll for updates when the app becomes visible again (Android often keeps the old SW)
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+      setInterval(() => reg.update().catch(() => {}), 60_000);
+    } catch (_) {}
+  });
+  let refreshing = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshing) return;
+    refreshing = true;
+    location.reload();
+  });
 }
 
 // test hooks
@@ -685,6 +848,22 @@ window.Chordbox = {
   get metroTimer() { return metroTimer; },
   get arpTimer() { return arpTimer; },
   get keyPointers() { return keyPointers; },
+  tapLatch, ensureArp, stopArp, makeArpVoice, arpStepMs,
+  setLatch(v) { state.latch = !!v; $('#btnLatch')?.setAttribute('aria-pressed', String(state.latch)); refreshReadout(); },
   pressKey: (deg, pid=1) => { const b = document.querySelector(`.key[data-deg="${deg}"]`); if (!b) return; b.dispatchEvent(new PointerEvent('pointerdown', { bubbles:true, pointerId:pid, pointerType:'touch', buttons:1, button:0, cancelable:true })); },
   releaseKey: (deg, pid=1) => { const b = document.querySelector(`.key[data-deg="${deg}"]`); if (!b) return; b.dispatchEvent(new PointerEvent('pointerup', { bubbles:true, pointerId:pid, pointerType:'touch', buttons:0, button:0, cancelable:true })); },
+  touchKey: (deg, id=1) => { const b = document.querySelector(`.key[data-deg="${deg}"]`); if (!b) return;
+    const t = { identifier: id, clientX: 0, clientY: 0, force: 1, pageX: 0, pageY: 0, radiusX: 1, radiusY: 1, rotationAngle: 0, screenX: 0, screenY: 0, target: b };
+    const ev = new Event('touchstart', { bubbles:true, cancelable:true });
+    Object.defineProperty(ev, 'changedTouches', { get: () => [t] });
+    Object.defineProperty(ev, 'touches', { get: () => [t] });
+    b.dispatchEvent(ev);
+  },
+  untouchKey: (deg, id=1) => { const b = document.querySelector(`.key[data-deg="${deg}"]`); if (!b) return;
+    const t = { identifier: id, clientX: 0, clientY: 0, force: 0, pageX: 0, pageY: 0, radiusX: 1, radiusY: 1, rotationAngle: 0, screenX: 0, screenY: 0, target: b };
+    const ev = new Event('touchend', { bubbles:true, cancelable:true });
+    Object.defineProperty(ev, 'changedTouches', { get: () => [t] });
+    Object.defineProperty(ev, 'touches', { get: () => [] });
+    b.dispatchEvent(ev);
+  },
 };
