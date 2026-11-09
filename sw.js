@@ -1,5 +1,5 @@
 // Chordbox service worker — installable + offline after first load.
-const CACHE = 'chordbox-v1.0';
+const CACHE = 'chordbox-v1.0.1';
 const SHELL = ['./', './index.html', './app.css', './app.js', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL.map(u => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));

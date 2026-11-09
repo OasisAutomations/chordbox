@@ -1,6 +1,6 @@
 /* Chordbox v1.0 — original pocket chord synth (Web Audio). Offline PWA. */
 'use strict';
-const VER = 'v1.0';
+const VER = 'v1.0.1';
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
@@ -28,6 +28,7 @@ const state = {
 
 let ac = null, master = null, filter = null, fxGain = null, dryGain = null, convolver = null, delay = null, delayGain = null, analyser = null;
 let metroTimer = null, loopTimer = null, arpTimer = null, beat = 0;
+let loopTimeouts = []; // pending bar event timers — must cancel on CLR / stop
 
 /* ---------- audio bootstrap ---------- */
 function unlock() {
@@ -210,7 +211,7 @@ function startChord(deg, fromLoop = false) {
   if (state.held.has(deg)) stopChord(deg);
   const { notes, label } = chordMidi(deg);
   const voices = notes.map(n => makeVoice(n));
-  state.held.set(deg, { voices, label, notes, t0: ac.currentTime });
+  state.held.set(deg, { voices, label, notes, t0: ac.currentTime, fromLoop: !!fromLoop });
   paintKey(deg, true, label);
   if (state.arp) ensureArp();
   if (state.loop.rec && !fromLoop) recordEvent('on', deg);
@@ -223,21 +224,32 @@ function stopChord(deg, fromLoop = false) {
   state.held.delete(deg);
   paintKey(deg, false);
   if (state.loop.rec && !fromLoop) recordEvent('off', deg);
-  if (!state.held.size && arpTimer) { clearInterval(arpTimer); arpTimer = null; }
+  if (!state.held.size) stopArp();
 }
 
 /* ---------- arp ---------- */
+let arpNoteTimers = [];
+function stopArpNotes() {
+  for (const { id, voice } of arpNoteTimers) { clearTimeout(id); try { voice.stop(); } catch (_) {} }
+  arpNoteTimers = [];
+}
+function stopArp() {
+  if (arpTimer) { clearInterval(arpTimer); arpTimer = null; }
+  stopArpNotes();
+}
 function ensureArp() {
   if (arpTimer || !state.arp) return;
   let i = 0;
   const step = () => {
-    if (!state.arp || !state.held.size) { clearInterval(arpTimer); arpTimer = null; return; }
+    if (!state.arp || !state.held.size) { stopArp(); return; }
     const entries = [...state.held.values()];
     const all = entries.flatMap(e => e.notes);
     if (!all.length) return;
     const n = all[i % all.length];
     const v = makeVoice(n);
-    setTimeout(() => v.stop(), Math.max(80, (60 / state.bpm) * 1000 * 0.35));
+    const dur = Math.max(80, (60 / state.bpm) * 1000 * 0.35);
+    const id = setTimeout(() => { v.stop(); arpNoteTimers = arpNoteTimers.filter(x => x.id !== id); }, dur);
+    arpNoteTimers.push({ id, voice: v });
     i++;
   };
   step();
@@ -296,8 +308,22 @@ function recordEvent(type, deg) {
   const at = (t - L.start) % (L.len || barMs());
   L.events.push({ type, deg, at });
 }
+function cancelLoopSched() {
+  for (const id of loopTimeouts) clearTimeout(id);
+  loopTimeouts = [];
+}
+function silenceLoopVoices() {
+  for (const [deg, v] of [...state.held.entries()]) {
+    if (v.fromLoop) stopChord(deg, true);
+  }
+  stopArpNotes();
+}
+function silenceAllVoices() {
+  for (const deg of [...state.held.keys()]) stopChord(deg, true);
+  stopArp();
+}
 function startMetro() {
-  stopMetro();
+  stopMetro(); // always replace — avoids duplicate intervals if Rec/Play/Met race
   beat = 0;
   const tick = () => {
     paintBeat(beat);
@@ -309,8 +335,7 @@ function startMetro() {
   metroTimer = setInterval(tick, (60 / state.bpm) * 1000);
 }
 function stopMetro() {
-  if (metroTimer) clearInterval(metroTimer);
-  metroTimer = null;
+  if (metroTimer) { clearInterval(metroTimer); metroTimer = null; }
   paintBeat(-1);
 }
 function click(accent) {
@@ -330,49 +355,80 @@ function paintBeat(i) {
   });
 }
 function playLoopBeat(b) {
-  // scheduled via events relative to bar; on beat 0 restart scan
   if (b !== 0) return;
   const L = state.loop;
-  if (!L.events.length) return;
+  if (!L.playing || !L.events.length) return;
   const len = L.len || barMs();
-  // clear currently sounding loop voices first? keep live held; only fire recorded
+  cancelLoopSched(); // one bar schedule at a time — no stacked duplicates
   L.events.forEach(ev => {
-    setTimeout(() => {
+    const id = setTimeout(() => {
+      loopTimeouts = loopTimeouts.filter(x => x !== id);
       if (!state.loop.playing) return;
       if (ev.type === 'on') startChord(ev.deg, true);
       else stopChord(ev.deg, true);
     }, ev.at % len);
+    loopTimeouts.push(id);
   });
+}
+function syncLoopButtons() {
+  const L = state.loop;
+  $('#btnRec').setAttribute('aria-pressed', String(!!L.rec));
+  $('#btnPlayLoop').setAttribute('aria-pressed', String(!!L.playing));
+  $('#btnPlayLoop').textContent = L.playing ? '■' : '▶';
+}
+function stopLoopPlayback({ keepMet = false } = {}) {
+  state.loop.playing = false;
+  state.loop.rec = false;
+  cancelLoopSched();
+  silenceLoopVoices();
+  syncLoopButtons();
+  if (!keepMet && !state.met) stopMetro();
 }
 function toggleRec() {
   const L = state.loop;
-  L.rec = !L.rec;
-  $('#btnRec').setAttribute('aria-pressed', String(L.rec));
   if (L.rec) {
-    if (!L.len) L.len = barMs();
-    if (!L.start) L.start = performance.now();
-    if (!state.met && !metroTimer) { state.met = true; $('#btnMet').setAttribute('aria-pressed', 'true'); startMetro(); }
-    if (!L.playing) { L.playing = true; $('#btnPlayLoop').setAttribute('aria-pressed', 'true'); }
+    // arm off — keep playing if there are events, else just stop recording
+    L.rec = false;
+    syncLoopButtons();
+    return;
   }
+  L.rec = true;
+  if (!L.len) L.len = barMs();
+  if (!L.start) L.start = performance.now();
+  L.playing = true; // overdub while the bar runs
+  if (!state.met) { state.met = true; $('#btnMet').setAttribute('aria-pressed', 'true'); }
+  startMetro(); // fresh single interval
+  syncLoopButtons();
 }
 function toggleLoopPlay() {
   const L = state.loop;
-  L.playing = !L.playing;
-  $('#btnPlayLoop').setAttribute('aria-pressed', String(L.playing));
-  $('#btnPlayLoop').textContent = L.playing ? '■' : '▶';
   if (L.playing) {
-    if (!metroTimer) startMetro();
-  } else if (!state.met && !L.rec) stopMetro();
+    // ▶ / ■ stops playback immediately (and recording arm)
+    stopLoopPlayback({ keepMet: state.met });
+    return;
+  }
+  if (!L.events.length) return; // nothing to play
+  L.playing = true;
+  L.rec = false;
+  syncLoopButtons();
+  startMetro();
 }
 function clearLoop() {
+  // CLR: hard stop — cancel timers, silence loop (+ arp) voices, wipe data, reset buttons
+  state.loop.playing = false;
+  state.loop.rec = false;
   state.loop.events = [];
   state.loop.start = 0;
-  state.loop.rec = false;
-  state.loop.playing = false;
-  $('#btnRec').setAttribute('aria-pressed', 'false');
-  $('#btnPlayLoop').setAttribute('aria-pressed', 'false');
-  $('#btnPlayLoop').textContent = '▶';
-  if (!state.met) stopMetro();
+  state.loop.len = 0;
+  cancelLoopSched();
+  silenceAllVoices();
+  syncLoopButtons();
+  if (state.met) {
+    // metronome alone may keep clicking; ensure only one metro interval
+    startMetro();
+  } else {
+    stopMetro();
+  }
 }
 
 /* ---------- UI: keys ---------- */
@@ -482,7 +538,7 @@ function wire() {
     state.arp = !state.arp;
     $('#btnArp').setAttribute('aria-pressed', String(state.arp));
     if (state.arp && state.held.size) ensureArp();
-    if (!state.arp && arpTimer) { clearInterval(arpTimer); arpTimer = null; }
+    if (!state.arp) stopArp();
     refreshReadout();
   };
   $('#btnTempo').onclick = () => {
@@ -491,7 +547,7 @@ function wire() {
     state.bpm = opts[(i + 1) % opts.length];
     if (state.fx === 'echo' && ac) delay.delayTime.setTargetAtTime(60 / state.bpm, ac.currentTime, 0.05);
     if (metroTimer) startMetro();
-    if (arpTimer) { clearInterval(arpTimer); arpTimer = null; if (state.arp) ensureArp(); }
+    if (arpTimer) { stopArp(); if (state.arp) ensureArp(); }
     if (state.loop.len) state.loop.len = barMs();
     refreshReadout();
   };
@@ -540,7 +596,11 @@ if ('serviceWorker' in navigator) {
 // test hooks
 window.Chordbox = {
   VER, state, unlock, resume, startChord, stopChord, chordMidi, degreeRoot,
+  clearLoop, stopLoopPlayback, cancelLoopSched, silenceAllVoices, toggleLoopPlay, toggleRec,
   get ctx() { return ac; },
   get filter() { return filter; },
   get held() { return state.held; },
+  get loopTimeouts() { return loopTimeouts; },
+  get metroTimer() { return metroTimer; },
+  get arpTimer() { return arpTimer; },
 };
