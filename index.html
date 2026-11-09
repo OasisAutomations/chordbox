@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no, maximum-scale=1">
+<title>Chordbox — pocket chord synth</title>
+<meta name="description" content="Chordbox: a pocket chord synthesizer in your browser. Seven diatonic keys, XY pad, arpeggiator, loop recorder. Works offline.">
+<meta name="theme-color" content="#3a3d42">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="gate" class="gate" role="dialog" aria-label="Tap to start">
+  <div class="gate-card">
+    <div class="logo" aria-hidden="true"></div>
+    <h1>Chordbox</h1>
+    <p>Pocket chord synth</p>
+    <button id="startBtn" class="start">Tap to play</button>
+    <p class="fine">Audio stays on this device. Works offline after first load.</p>
+  </div>
+</div>
+
+<main id="unit" class="unit" aria-label="Chordbox">
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <span class="name">Chordbox</span>
+      <span class="ver" id="ver">v1.0</span>
+    </div>
+    <div class="readout" id="readout" aria-live="polite">C major · oct 3 · Pad</div>
+  </header>
+
+  <section class="grille" aria-hidden="true">
+    <div class="speaker"></div>
+  </section>
+
+  <section class="xywrap">
+    <div class="xy" id="xy" role="application" aria-label="Chord morph pad. Hold and drag: up 7th, down sus, left minor/major flip, right add9. Also opens the filter.">
+      <div class="xy-cross" aria-hidden="true"></div>
+      <div class="xy-knob" id="xyKnob" aria-hidden="true"></div>
+      <div class="xy-labels" aria-hidden="true">
+        <span class="n">7</span><span class="s">sus</span><span class="w">±</span><span class="e">9</span>
+      </div>
+    </div>
+    <div class="xy-hint">hold · morph + filter</div>
+  </section>
+
+  <section class="funcs" aria-label="Controls">
+    <button class="fbtn" id="btnKey" type="button" title="Key / scale"><span>KEY</span><b id="keyLbl">C</b></button>
+    <button class="fbtn" id="btnOct" type="button" title="Octave"><span>OCT</span><b id="octLbl">3</b></button>
+    <button class="fbtn" id="btnSound" type="button" title="Sound"><span>SND</span><b id="sndLbl">Pad</b></button>
+    <button class="fbtn" id="btnArp" type="button" title="Arpeggiator" aria-pressed="false"><span>ARP</span><b id="arpLbl">Off</b></button>
+    <button class="fbtn" id="btnTempo" type="button" title="Tempo"><span>BPM</span><b id="bpmLbl">96</b></button>
+    <button class="fbtn" id="btnFx" type="button" title="Reverb / delay"><span>FX</span><b id="fxLbl">Room</b></button>
+  </section>
+
+  <section class="loopbar" aria-label="Loop recorder">
+    <button class="lbtn" id="btnMet" type="button" title="Metronome" aria-pressed="false">♩</button>
+    <div class="beats" id="beats" aria-hidden="true">
+      <i></i><i></i><i></i><i></i>
+    </div>
+    <button class="lbtn rec" id="btnRec" type="button" title="Record / overdub" aria-pressed="false">●</button>
+    <button class="lbtn" id="btnPlayLoop" type="button" title="Play / stop loop" aria-pressed="false">▶</button>
+    <button class="lbtn" id="btnClear" type="button" title="Clear loop">CLR</button>
+  </section>
+
+  <section class="keys" id="keys" aria-label="Chord keys">
+    <!-- filled by JS -->
+  </section>
+
+  <footer class="foot">Original web instrument. Not affiliated with any hardware brand.</footer>
+</main>
+
+<!-- pickers -->
+<dialog id="dlgKey" class="dlg">
+  <form method="dialog">
+    <h2>Key &amp; scale</h2>
+    <div class="grid keysels" id="keyGrid"></div>
+    <div class="seg" id="scaleSeg">
+      <button value="major" type="submit" data-scale="major">Major</button>
+      <button value="minor" type="submit" data-scale="minor">Minor</button>
+    </div>
+    <button class="close" value="cancel">Close</button>
+  </form>
+</dialog>
+
+<dialog id="dlgSound" class="dlg">
+  <form method="dialog">
+    <h2>Sound</h2>
+    <div class="seg tall" id="sndSeg">
+      <button type="submit" data-snd="pad">Pad</button>
+      <button type="submit" data-snd="keys">Keys</button>
+      <button type="submit" data-snd="pluck">Pluck</button>
+      <button type="submit" data-snd="organ">Organ</button>
+    </div>
+    <button class="close" value="cancel">Close</button>
+  </form>
+</dialog>
+
+<dialog id="dlgFx" class="dlg">
+  <form method="dialog">
+    <h2>Space</h2>
+    <div class="seg tall" id="fxSeg">
+      <button type="submit" data-fx="dry">Dry</button>
+      <button type="submit" data-fx="room">Room</button>
+      <button type="submit" data-fx="hall">Hall</button>
+      <button type="submit" data-fx="echo">Echo</button>
+    </div>
+    <button class="close" value="cancel">Close</button>
+  </form>
+</dialog>
+
+<script src="app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+import { chromium } from 'playwright';
+const URL = process.argv[2] || 'http://127.0.0.1:18790/';
+const errs = [];
+const browser = await chromium.launch({ executablePath: '/usr/bin/google-chrome', args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required'] });
+const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+const page = await ctx.newPage();
+page.on('pageerror', e => errs.push('page: ' + e.message));
+page.on('console', m => { if (m.type() === 'error') errs.push('console: ' + m.text()); });
+await page.goto(URL, { waitUntil: 'networkidle' });
+await page.wait_for_timeout(500);
+const title = await page.title();
+const gate = await page.isVisible('#gate');
+const keys = await page.locator('#keys .key').count();
+console.log('title', title);
+console.log('gate', gate, 'keys', keys);
+await page.tap('#startBtn');
+await page.wait_for_timeout(600);
+const gateGone = await page.evaluate(() => document.getElementById('gate').hidden);
+const audio = await page.evaluate(async () => {
+  await window.Chordbox.resume();
+  const before = window.Chordbox.ctx?.state;
+  window.Chordbox.startChord(0);
+  const held = window.Chordbox.held.size;
+  const nodes = window.Chordbox.held.get(0)?.voices?.length || 0;
+  const dest = !!window.Chordbox.filter;
+  // multitouch second chord
+  window.Chordbox.startChord(4);
+  const held2 = window.Chordbox.held.size;
+  window.Chordbox.stopChord(0);
+  window.Chordbox.stopChord(4);
+  // XY
+  window.Chordbox.state.xy = { x: 0, y: 0.8, held: true };
+  const c7 = window.Chordbox.chordMidi(0);
+  window.Chordbox.state.xy = { x: 0, y: 0, held: false };
+  return { before, held, nodes, dest, held2, c7notes: c7.notes.length, c7label: c7.label, ver: window.Chordbox.VER };
+});
+console.log('audio', JSON.stringify(audio));
+// tap a real key
+await page.locator('.key[data-deg="0"]').tap();
+await page.wait_for_timeout(200);
+const afterTap = await page.evaluate(() => ({ held: window.Chordbox.held.size, keyOn: document.querySelector('.key[data-deg="0"]').classList.contains('on') }));
+await page.locator('.key[data-deg="0"]').dispatchEvent('pointerup');
+await page.wait_for_timeout(100);
+console.log('tap', afterTap);
+console.log('errs', errs);
+const ok = gateGone && keys === 7 && audio.held >= 1 && audio.nodes >= 3 && audio.held2 === 2 && audio.c7notes >= 4 && !errs.length;
+console.log(ok ? 'RESULT PASS' : 'RESULT FAIL');
+await page.screenshot({ path: '/workspace/chordbox/shot-phone.png' });
+await browser.close();
+process.exit(ok ? 0 : 1);
