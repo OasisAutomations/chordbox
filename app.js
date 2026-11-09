@@ -1,6 +1,6 @@
 /* Chordbox v1.0 — original pocket chord synth (Web Audio). Offline PWA. */
 'use strict';
-const VER = 'v1.0.1';
+const VER = 'v1.0.2';
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
@@ -208,7 +208,12 @@ function makeVoice(midi, when = ac.currentTime) {
 
 function startChord(deg, fromLoop = false) {
   if (!ac) return;
-  if (state.held.has(deg)) stopChord(deg);
+  // Silent replace: don't record a false off or tear down the arp interval mid-hold
+  if (state.held.has(deg)) {
+    const prev = state.held.get(deg);
+    prev.voices.forEach(x => x.stop());
+    state.held.delete(deg);
+  }
   const { notes, label } = chordMidi(deg);
   const voices = notes.map(n => makeVoice(n));
   state.held.set(deg, { voices, label, notes, t0: ac.currentTime, fromLoop: !!fromLoop });
@@ -225,6 +230,7 @@ function stopChord(deg, fromLoop = false) {
   paintKey(deg, false);
   if (state.loop.rec && !fromLoop) recordEvent('off', deg);
   if (!state.held.size) stopArp();
+  refreshReadout();
 }
 
 /* ---------- arp ---------- */
@@ -240,6 +246,7 @@ function stopArp() {
 function ensureArp() {
   if (arpTimer || !state.arp) return;
   let i = 0;
+  state.arpFires = state.arpFires || 0;
   const step = () => {
     if (!state.arp || !state.held.size) { stopArp(); return; }
     const entries = [...state.held.values()];
@@ -247,12 +254,14 @@ function ensureArp() {
     if (!all.length) return;
     const n = all[i % all.length];
     const v = makeVoice(n);
+    state.arpFires++;
     const dur = Math.max(80, (60 / state.bpm) * 1000 * 0.35);
     const id = setTimeout(() => { v.stop(); arpNoteTimers = arpNoteTimers.filter(x => x.id !== id); }, dur);
     arpNoteTimers.push({ id, voice: v });
     i++;
   };
   step();
+  // half-notes at BPM — keep going until every held key is released
   arpTimer = setInterval(step, (60 / state.bpm) * 1000 / 2);
 }
 
@@ -288,15 +297,31 @@ function bindXy() {
     const y = -(((t.clientY - r.top) / r.height) * 2 - 1);
     return [x, y];
   };
-  const down = (e) => { e.preventDefault(); resume(); const [x, y] = pt(e); setXy(x, y, true); };
-  const move = (e) => { if (!state.xy.held) return; e.preventDefault(); const [x, y] = pt(e); setXy(x, y, true); };
-  const up = (e) => { e.preventDefault(); setXy(0, 0, false); };
+  let xyPtr = null;
+  const down = (e) => {
+    e.preventDefault(); resume(); xyPtr = e.pointerId;
+    try { el.setPointerCapture(e.pointerId); } catch (_) {}
+    const [x, y] = pt(e); setXy(x, y, true);
+  };
+  const move = (e) => {
+    if (!state.xy.held || (xyPtr != null && e.pointerId !== xyPtr)) return;
+    e.preventDefault(); const [x, y] = pt(e); setXy(x, y, true);
+  };
+  const up = (e) => {
+    if (xyPtr != null && e.pointerId !== xyPtr) return;
+    e.preventDefault(); xyPtr = null; setXy(0, 0, false);
+  };
   el.addEventListener('pointerdown', down);
   el.addEventListener('pointermove', move);
   el.addEventListener('pointerup', up);
-  el.addEventListener('pointercancel', up);
-  el.addEventListener('pointerleave', (e) => { if (e.buttons === 0) up(e); });
+  el.addEventListener('pointercancel', (e) => { if (e.buttons & 1) { e.preventDefault(); return; } up(e); });
+  // Keep morphing if the finger slides off the pad while captured
+  el.addEventListener('pointerleave', e => e.preventDefault());
+  el.addEventListener('lostpointercapture', e => { if (xyPtr === e.pointerId && !(e.buttons & 1)) up(e); });
+  el.addEventListener('contextmenu', e => e.preventDefault());
+  el.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
 }
+
 
 /* ---------- loop / metro ---------- */
 function barMs() { return (60 / state.bpm) * 1000 * 4; }
@@ -421,6 +446,7 @@ function clearLoop() {
   state.loop.start = 0;
   state.loop.len = 0;
   cancelLoopSched();
+  keyPointers.clear();
   silenceAllVoices();
   syncLoopButtons();
   if (state.met) {
@@ -432,6 +458,61 @@ function clearLoop() {
 }
 
 /* ---------- UI: keys ---------- */
+// Active pointer ids per degree — sustains across Android long-press / scroll attempts
+const keyPointers = new Map(); // deg -> Set<pointerId>
+
+function bindKeyPointer(btn, deg) {
+  const active = () => { if (!keyPointers.has(deg)) keyPointers.set(deg, new Set()); return keyPointers.get(deg); };
+  const down = (e) => {
+    if (e.button != null && e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    resume();
+    const ids = active();
+    const first = ids.size === 0;
+    ids.add(e.pointerId);
+    try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+    if (first) startChord(deg);
+  };
+  const up = (e) => {
+    e.preventDefault();
+    const ids = keyPointers.get(deg);
+    if (!ids || !ids.has(e.pointerId)) return;
+    ids.delete(e.pointerId);
+    try { if (btn.hasPointerCapture?.(e.pointerId)) btn.releasePointerCapture(e.pointerId); } catch (_) {}
+    if (ids.size === 0) { keyPointers.delete(deg); stopChord(deg); }
+  };
+  // Android Chrome often fires pointercancel on long-press when a context menu would open.
+  // We prevent the menu; if cancel still arrives but the finger is logically down, keep sustaining.
+  const cancel = (e) => {
+    e.preventDefault();
+    const ids = keyPointers.get(deg);
+    if (!ids || !ids.has(e.pointerId)) return;
+    // If the browser still reports the button/finger as down, ignore this cancel (long-press noise)
+    if (e.buttons && (e.buttons & 1)) return;
+    ids.delete(e.pointerId);
+    if (ids.size === 0) { keyPointers.delete(deg); stopChord(deg); }
+  };
+  btn.addEventListener('pointerdown', down);
+  btn.addEventListener('pointerup', up);
+  btn.addEventListener('pointercancel', cancel);
+  // Do NOT stop on lostpointercapture or pointerleave — capture + up handle release.
+  // Leaving the key while held must keep the chord/arp going (joystick-style sustain).
+  btn.addEventListener('pointerleave', e => { e.preventDefault(); });
+  btn.addEventListener('lostpointercapture', e => {
+    // Only release if we no longer track this pointer as down (real release already ran).
+    const ids = keyPointers.get(deg);
+    if (ids && ids.has(e.pointerId) && !(e.buttons & 1)) {
+      ids.delete(e.pointerId);
+      if (ids.size === 0) { keyPointers.delete(deg); stopChord(deg); }
+    }
+  });
+  btn.addEventListener('contextmenu', e => { e.preventDefault(); e.stopPropagation(); });
+  // Non-passive touchstart so iOS/Android can't scroll/select on long press
+  btn.addEventListener('touchstart', e => { e.preventDefault(); }, { passive: false });
+  btn.addEventListener('touchend', e => { e.preventDefault(); }, { passive: false });
+}
+
 function scaleLabels() {
   return state.scale === 'minor' ? DEG_LABELS_MIN : DEG_LABELS;
 }
@@ -449,16 +530,10 @@ function buildKeys() {
     btn.className = 'key' + (q === 'm' ? ' minor' : q === 'dim' ? ' dim' : '');
     btn.dataset.deg = deg;
     btn.innerHTML = `<span class="deg">${labs[deg]}</span><span class="nm">${noteName(degreeRoot(deg))}</span><span class="ql">${q || 'maj'}</span>`;
-    // multitouch via pointer events with setPointerCapture
-    btn.addEventListener('pointerdown', e => {
-      e.preventDefault();
-      resume();
-      try { btn.setPointerCapture(e.pointerId); } catch (_) {}
-      startChord(deg);
-    });
-    btn.addEventListener('pointerup', e => { e.preventDefault(); stopChord(deg); });
-    btn.addEventListener('pointercancel', e => { e.preventDefault(); stopChord(deg); });
-    btn.addEventListener('lostpointercapture', () => stopChord(deg));
+    // Multitouch hold: capture the pointer, ignore leave/lost-capture noise (Android long-press),
+    // and only release when THIS pointer goes up. Spurious pointercancel from a blocked context
+    // menu is ignored while the pointer is still in our active set and buttons are down.
+    bindKeyPointer(btn, deg);
     root.appendChild(btn);
   }
 }
@@ -570,6 +645,12 @@ function wire() {
   $('#btnPlayLoop').onclick = () => { resume(); toggleLoopPlay(); };
   $('#btnClear').onclick = () => clearLoop();
   bindXy();
+  // Kill long-press callouts / selection / synthetic cancels across the instrument
+  const unit = $('#unit');
+  unit.addEventListener('contextmenu', e => e.preventDefault());
+  unit.addEventListener('selectstart', e => e.preventDefault());
+  unit.addEventListener('dragstart', e => e.preventDefault());
+  document.addEventListener('gesturestart', e => e.preventDefault());
 }
 
 /* ---------- boot ---------- */
@@ -603,4 +684,7 @@ window.Chordbox = {
   get loopTimeouts() { return loopTimeouts; },
   get metroTimer() { return metroTimer; },
   get arpTimer() { return arpTimer; },
+  get keyPointers() { return keyPointers; },
+  pressKey: (deg, pid=1) => { const b = document.querySelector(`.key[data-deg="${deg}"]`); if (!b) return; b.dispatchEvent(new PointerEvent('pointerdown', { bubbles:true, pointerId:pid, pointerType:'touch', buttons:1, button:0, cancelable:true })); },
+  releaseKey: (deg, pid=1) => { const b = document.querySelector(`.key[data-deg="${deg}"]`); if (!b) return; b.dispatchEvent(new PointerEvent('pointerup', { bubbles:true, pointerId:pid, pointerType:'touch', buttons:0, button:0, cancelable:true })); },
 };
